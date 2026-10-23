@@ -160,10 +160,16 @@ def source_url(kb_name: str, record: dict[str, Any], *, image: bool = False) -> 
         return workspace_url(f"{base}/visual-assets/{record['asset_id']}")
     if image:
         query = {
-            "source_path": record["source_path"],
             "page": record["page_number"],
-            "source_hash": record["source_document_id"],
         }
+        # The hash is a content identifier; the backend resolves the document
+        # from it. Keeping the long percent-encoded path out of the URL makes
+        # it short enough that a model copying a second image into its answer
+        # cannot silently truncate the filename.
+        if record.get("source_document_id"):
+            query["source_hash"] = record["source_document_id"]
+        else:
+            query["source_path"] = record["source_path"]
         if record.get("region"):
             query["region"] = ",".join(str(x) for x in record["region"])
         return workspace_url(f"{base}/source-page?{urlencode(query)}")

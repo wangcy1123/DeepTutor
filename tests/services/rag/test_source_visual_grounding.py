@@ -315,6 +315,15 @@ def test_coverage_and_page_http_routes_retain_source_guard_and_hash(textbook, mo
     assert page.status_code == 200
     assert page.headers["content-type"] == "image/png"
     assert page.headers["x-source-document-id"] == candidates[0].record["source_document_id"]
+    by_hash = client.get(
+        "/api/knowledge-bases/kb/source-page",
+        params={
+            "page": 101,
+            "source_hash": candidates[0].record["source_document_id"],
+        },
+    )
+    assert by_hash.status_code == 200
+    assert by_hash.headers["content-type"] == "image/png"
     invalid = client.get(
         "/api/knowledge-bases/kb/source-page", params={"source_path": "../secret.pdf", "page": 1}
     )

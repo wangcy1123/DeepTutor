@@ -3272,16 +3272,21 @@ async def kb_visual_coverage(
 @router.get("/knowledge-bases/{kb_name}/source-page")
 async def kb_source_page(
     kb_name: str,
-    source_path: str,
+    source_path: str = "",
     page: int = Query(..., ge=1),
     source_hash: str = "",
     region: str = "",
 ):
+    from deeptutor.services.rag.source_pages import source_path_for_digest
     from deeptutor.services.rag.source_visuals import page_image
 
     raw_dir = _resolve_kb_raw_dir(kb_name)
     assert raw_dir is not None
     try:
+        if not source_path:
+            source_path = await asyncio.to_thread(
+                source_path_for_digest, raw_dir.parent, source_hash
+            )
         crop = [float(value) for value in region.split(",")] if region else None
         record, image = await asyncio.to_thread(
             page_image, raw_dir.parent, source_path, page, expected_hash=source_hash, region=crop

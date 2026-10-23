@@ -54,6 +54,36 @@ def resolve_source(ref: SourceRef) -> Path:
     return path
 
 
+def source_path_for_digest(kb_dir: Path, digest: str) -> str:
+    """Resolve an authorized raw source path from its content digest.
+
+    The persisted page catalog is the fast path; a raw-file scan is the
+    fallback for a KB that has no catalog (tests, very old indexes). The
+    returned path is relative to ``raw/`` so ``page_image`` can validate it.
+    """
+    if not digest:
+        raise SourcePageError("source_path or source_hash is required.")
+    raw_dir = Path(kb_dir) / "raw"
+    for catalog in sorted(Path(kb_dir).glob("version-*/source_pages.json")):
+        try:
+            payload = json.loads(catalog.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        pages = payload.get("pages") if isinstance(payload, dict) else None
+        if not isinstance(pages, list):
+            continue
+        for entry in pages:
+            if not isinstance(entry, dict) or entry.get("source_digest") != digest:
+                continue
+            candidate = str(entry.get("document_key") or entry.get("file_name") or "")
+            if candidate and (raw_dir / candidate).is_file():
+                return candidate
+    for path in sorted(raw_dir.rglob("*")):
+        if path.is_file() and path.suffix.casefold() == ".pdf" and source_digest(path) == digest:
+            return path.relative_to(raw_dir).as_posix()
+    raise SourcePageError("Source is unavailable; select an existing document.")
+
+
 def render_source_page(ref: SourceRef) -> bytes:
     from deeptutor.multi_user.knowledge_access import resolve_for_rag
     from deeptutor.services.rag.source_visuals import page_image
@@ -77,8 +107,10 @@ def render_source_page(ref: SourceRef) -> bytes:
 
 
 def preview_url(ref: SourceRef) -> str:
+    # The source hash is a content identifier and the backend resolves the
+    # document from it. Omitting the long percent-encoded path keeps the URL
+    # short enough that a model copying it into an answer does not truncate it.
     query = {
-        "source_path": ref.document_key,
         "source_hash": ref.source_digest,
         "page": str(ref.page_index + 1),
     }

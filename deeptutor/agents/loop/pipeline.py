@@ -27,6 +27,7 @@ import logging
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode
 
 from deeptutor.agents._shared.tool_composition import (
     ToolMountFlags,
@@ -124,6 +125,34 @@ _MANGLED_INTERNAL_URL = re.compile(
 def _repair_site_relative_urls(text: str) -> str:
     """Restore internal API links a model prefixed with a fake scheme/host."""
     return _MANGLED_INTERNAL_URL.sub("/api/knowledge-bases", text)
+
+
+_SOURCE_PAGE_URL = re.compile(
+    r"(?P<prefix>\(|href=[\"'])(?P<path>/api/knowledge-bases/[^)\s\"']+/source-page)"
+    r"\?(?P<query>[^)\s\"']+)"
+)
+
+
+def _repair_source_page_urls(text: str) -> str:
+    """Drop a model-corrupted ``source_path`` when the hash can resolve it.
+
+    The model copies long percent-encoded filenames unreliably: in an answer
+    with two images the second path can lose a segment (``讲义三至四章``
+    instead of ``讲义上-2-第三至四章``) and that image silently 422s. The
+    content hash survives copying, and the backend resolves the document from
+    it, so removing ``source_path`` repairs the link and shortens the URL for
+    the next copy.
+    """
+    def repair(match: re.Match[str]) -> str:
+        pairs = parse_qsl(match.group("query"), keep_blank_values=True)
+        if not any(key == "source_hash" and value for key, value in pairs):
+            return match.group(0)
+        kept = [(key, value) for key, value in pairs if key != "source_path"]
+        if len(kept) == len(pairs):
+            return match.group(0)
+        return f"{match.group('prefix')}{match.group('path')}?{urlencode(kept, doseq=True)}"
+
+    return _SOURCE_PAGE_URL.sub(repair, text)
 
 
 def _read_int(cfg: Any, *, key: str, default: int) -> int:
@@ -1631,7 +1660,7 @@ class AgenticLoopPipeline:
     ) -> None:
         if not text:
             return
-        text = _repair_site_relative_urls(text)
+        text = _repair_source_page_urls(_repair_site_relative_urls(text))
         await stream.content(
             text,
             source=self.event_source,
