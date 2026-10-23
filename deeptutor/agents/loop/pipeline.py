@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +110,20 @@ CONTEXT_WINDOW_GUARD_RATIO = 0.9
 # conservative amount for each image instead of treating source pixels as free.
 IMAGE_TOKEN_GUARD_RESERVE = 4096
 _DispatchOutcome = DispatchOutcome
+
+# Models asked to reproduce a site-relative image path tend to "absolutise"
+# it, turning ``/api/knowledge-bases/...`` into
+# ``https://api.knowledge-bases/...`` — a host that does not exist, so the
+# figure silently fails to load. The API mount prefix is ours and fixed, which
+# makes the repair unambiguous: no real host is named ``knowledge-bases``.
+_MANGLED_INTERNAL_URL = re.compile(
+    r"https?://(?:[A-Za-z0-9-]+\.)?knowledge-bases(?=[/?#]|$)", re.IGNORECASE
+)
+
+
+def _repair_site_relative_urls(text: str) -> str:
+    """Restore internal API links a model prefixed with a fake scheme/host."""
+    return _MANGLED_INTERNAL_URL.sub("/api/knowledge-bases", text)
 
 
 def _read_int(cfg: Any, *, key: str, default: int) -> int:
@@ -1616,6 +1631,7 @@ class AgenticLoopPipeline:
     ) -> None:
         if not text:
             return
+        text = _repair_site_relative_urls(text)
         await stream.content(
             text,
             source=self.event_source,
