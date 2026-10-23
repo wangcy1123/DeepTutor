@@ -73,6 +73,10 @@ class LlamaIndexDocumentLoader:
         self.logger = logger or logging.getLogger(__name__)
         self.image_concurrency = max(1, int(image_concurrency))
         self._pdf_documents: dict[str, list[Any]] = {}
+        # Parsed block lists keyed by source path. Non-PDF files (and PDFs that
+        # ``build_pdf_documents`` cannot cover) fall back to one Document per
+        # ``page_idx`` so their chunks still carry a page number.
+        self._blocks_by_path: dict[str, list[dict] | None] = {}
 
     async def load(
         self,
@@ -134,7 +138,7 @@ class LlamaIndexDocumentLoader:
                 if page_documents:
                     documents.extend(page_documents)
                 else:
-                    self._append_if_nonempty(
+                    self._append_paged_documents(
                         documents,
                         file_path,
                         text,
@@ -162,7 +166,7 @@ class LlamaIndexDocumentLoader:
                     self._parse_document, path, parse_service, kb_dir=kb_dir
                 )
                 if text.strip() or extracted_images:
-                    self._append_if_nonempty(
+                    self._append_paged_documents(
                         documents,
                         path,
                         text,
@@ -273,6 +277,7 @@ class LlamaIndexDocumentLoader:
                 for image in images
                 if image.path.resolve() in by_path
             ]
+        self._blocks_by_path[str(file_path)] = getattr(parsed, "blocks", None)
         return text, images, str(parsed.engine or "")
 
     @staticmethod
@@ -287,15 +292,33 @@ class LlamaIndexDocumentLoader:
             record = image.visual.record
             if candidates is not None:
                 candidates.append(image.visual)
-            caption = record["caption"] or "Source figure"
+            caption = record["caption"]
             context = record["context"]
-            text = f"[Source visual] {image.origin.name}: {caption}"
+            table_html = record.get("table_html")
+            section = record.get("section")
+            page_number = record.get("page_number")
+            # A crop with no caption, no surrounding text, no table and no
+            # section heading is indistinguishable from every other such crop:
+            # all of them read "[Source visual] <file>: Source figure". They
+            # match nothing but still occupy retrieval slots, so they are not
+            # indexed. The asset itself stays published in the visual store,
+            # which is what exact page/figure inspection reads — skipping the
+            # chunk costs no reachable image.
+            if not (caption or context or table_html or section):
+                continue
+            header = f"[Source visual] {image.origin.name}"
+            if page_number:
+                # Keep the page inside the chunk text as well as its metadata:
+                # retrieval text is what the model actually reads, and a figure
+                # it cannot locate is a figure it cannot ask to see.
+                header += f", page {page_number}"
+            text = f"{header}: {caption or 'Source figure'}"
             if context:
                 text += f"\nContext: {context}"
-            if record.get("table_html"):
-                text += f"\nStructured table: {record['table_html']}"
-            if record.get("section"):
-                text += f"\nSection: {record['section']}"
+            if table_html:
+                text += f"\nStructured table: {table_html}"
+            if section:
+                text += f"\nSection: {section}"
             documents.append(
                 Document(
                     text=text,
@@ -305,9 +328,9 @@ class LlamaIndexDocumentLoader:
                         "content_type": "source_visual",
                         "visual_asset_id": record["asset_id"],
                         "source_document_id": record["source_document_id"],
-                        "page": record["page_number"] or "",
+                        "page": page_number or "",
                         "bbox": record["bbox"],
-                        "caption": record["caption"],
+                        "caption": caption,
                         "source_locator": record["source_locator"],
                     },
                 )
@@ -340,6 +363,70 @@ class LlamaIndexDocumentLoader:
             if isinstance(block, dict)
         ]
         return "\n\n".join(part for part in parts if part)
+
+    @staticmethod
+    def _documents_by_page(blocks: list[dict] | None, file_path: Path) -> list[Any]:
+        """Split parsed blocks into one ``Document`` per source page.
+
+        Used for sources ``build_pdf_documents`` does not cover — non-PDF
+        parser output, PDFs outside ``kb_dir/raw``, and engines whose blocks
+        carry ``page_idx`` but no readable page geometry. Without this the page
+        boundary is lost during concatenation, and downstream chunks cannot
+        say which page they came from.
+        """
+        if not blocks:
+            return []
+        pages: dict[int, list[str]] = {}
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            page_idx = block.get("page_idx")
+            if page_idx is None:
+                continue
+            text = str(block.get("text") or block.get("content") or "").strip()
+            if not text and block.get("type") == "image":
+                captions = block.get("image_caption") or []
+                if isinstance(captions, list):
+                    text = " ".join(str(c).strip() for c in captions if str(c).strip())
+                else:
+                    text = str(captions).strip()
+            if text:
+                pages.setdefault(int(page_idx), []).append(text)
+        return [
+            Document(
+                text="\n\n".join(pages[idx]),
+                metadata={
+                    "file_name": file_path.name,
+                    "file_path": str(file_path),
+                    "page": idx + 1,
+                },
+            )
+            for idx in sorted(pages)
+        ]
+
+    def _append_paged_documents(
+        self,
+        documents: list[Any],
+        file_path: Path,
+        text: str,
+        *,
+        parse_engine: str = "",
+        extracted_image_count: int = 0,
+    ) -> None:
+        """Append page-tagged documents, falling back to the legacy path."""
+        blocks = self._blocks_by_path.pop(str(file_path), None)
+        paged = self._documents_by_page(blocks, file_path)
+        if paged:
+            documents.extend(paged)
+            self.logger.info(f"Loaded: {file_path.name} ({len(paged)} pages, page-tagged)")
+            return
+        self._append_if_nonempty(
+            documents,
+            file_path,
+            text,
+            parse_engine=parse_engine,
+            extracted_image_count=extracted_image_count,
+        )
 
     def _collect_asset_images(self, asset_dir: Path | None, *, origin: Path) -> list[_ImageSource]:
         """Gather images the parse engine extracted into ``asset_dir``.
