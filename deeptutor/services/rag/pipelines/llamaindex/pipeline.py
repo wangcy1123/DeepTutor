@@ -396,7 +396,10 @@ class LlamaIndexPipeline:
                     "title": meta.get("file_name", meta.get("title", f"Document {i + 1}")),
                     "content": node.node.text[:200],
                     "source": meta.get("file_path", meta.get("file_name", "")),
-                    "page": meta.get("page_label", meta.get("page", "")),
+                    # ``page_label`` is always present but empty when the PDF
+                    # has no printed page number, so a dict ``get`` default
+                    # never fires. Fall back on falsiness instead.
+                    "page": meta.get("page_label") or meta.get("page", ""),
                     "chunk_id": node.node.node_id or str(i),
                     "score": round(node.score, 4) if node.score is not None else "",
                     **(
