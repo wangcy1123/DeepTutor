@@ -161,6 +161,27 @@ async def _run_with_stall_guard(
             future.add_done_callback(_consume_terminal_exception)
 
 
+def _context_provenance(meta: dict[str, Any]) -> str:
+    """Citation header prepended to each retrieved passage.
+
+    ``page`` is the physical PDF page — exactly the number
+    ``retrieve_visual(page=...)`` expects. ``page_label`` is the printed
+    page number and is deliberately not shown: a model that copies the
+    printed number into an exact-page call fetches the wrong page.
+
+    Module-level rather than a method: ``_nodes_to_result`` is callable with
+    ``self=None`` in the pipeline tests, and this needs no instance state.
+    """
+    name = str(meta.get("file_name") or meta.get("title") or "").strip()
+    page = meta.get("page") or ""
+    bits = [name] if name else []
+    if page not in ("", None):
+        bits.append(f"PDF page {page}")
+    if meta.get("content_type") == "source_visual":
+        bits.append("source image")
+    return f"[{' · '.join(bits)}]\n" if bits else ""
+
+
 class LlamaIndexPipeline:
     """Pipeline that indexes and retrieves KB content via LlamaIndex."""
 
@@ -368,8 +389,8 @@ class LlamaIndexPipeline:
         context_parts: list[str] = []
         sources: list[dict[str, Any]] = []
         for i, node in enumerate(nodes):
-            context_parts.append(node.node.text)
             meta = node.node.metadata or {}
+            context_parts.append(_context_provenance(meta) + node.node.text)
             sources.append(
                 {
                     "title": meta.get("file_name", meta.get("title", f"Document {i + 1}")),
