@@ -1,0 +1,19 @@
+#!/bin/bash
+# Run this checkout's DeepTutor with the local runtime home.
+#
+# The `deeptutor` on PATH is the pipx install; this wrapper pins the source
+# venv and DEEPTUTOR_HOME so both `start` and `stop` act on the same instance.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="$ROOT/.venv/bin/deeptutor"
+
+if [ ! -x "$BIN" ]; then
+  echo "!! 找不到 $BIN，先建环境：" >&2
+  echo "   cd $ROOT && uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e ." >&2
+  exit 1
+fi
+
+export DEEPTUTOR_HOME="${DEEPTUTOR_HOME:-$HOME/my-deeptutor}"
+cd "$ROOT"
+exec "$BIN" "$@"
