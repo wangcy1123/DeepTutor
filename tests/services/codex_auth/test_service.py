@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from copy import deepcopy
 import hashlib
 import json
@@ -1517,6 +1518,71 @@ async def test_get_token_refreshes_inside_five_minute_window(tmp_path: Path) -> 
     assert oauth.refresh_calls == 1
     assert token.access_token == "refreshed-access"
     assert token.generation == 2
+
+
+def _jwt_with_exp(expires_at: int) -> str:
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": expires_at}).encode())
+    return f"header.{payload.rstrip(b'=').decode()}.signature"
+
+
+@pytest.mark.asyncio
+async def test_get_token_uses_still_valid_jwt_when_refresh_window_passed(
+    tmp_path: Path,
+) -> None:
+    """A 1-hour refresh schedule must not throw away a 10-day access token."""
+    clock = [1_000]
+    service, _callback, oauth, _catalog, store, _models = await _oauth_service(
+        tmp_path,
+        clock=clock,
+    )
+    access_token = _jwt_with_exp(2_000)
+    stored = _stored_credentials(expires_at=1_200)
+    store.commit_credentials(
+        CodexCredentials(
+            schema_version=stored.schema_version,
+            access_token=access_token,
+            refresh_token=stored.refresh_token,
+            id_token=stored.id_token,
+            account_id=stored.account_id,
+            expires_at=stored.expires_at,
+            generation=stored.generation,
+        ),
+        expected_generation=0,
+    )
+
+    token = await service.get_token()
+
+    assert oauth.refresh_calls == 0
+    assert token.access_token == access_token
+    assert token.expires_at == 2_000
+
+
+@pytest.mark.asyncio
+async def test_get_token_still_refreshes_when_jwt_has_expired(tmp_path: Path) -> None:
+    clock = [1_000]
+    service, _callback, oauth, _catalog, store, _models = await _oauth_service(
+        tmp_path,
+        clock=clock,
+    )
+    access_token = _jwt_with_exp(900)
+    stored = _stored_credentials(expires_at=1_200)
+    store.commit_credentials(
+        CodexCredentials(
+            schema_version=stored.schema_version,
+            access_token=access_token,
+            refresh_token=stored.refresh_token,
+            id_token=stored.id_token,
+            account_id=stored.account_id,
+            expires_at=stored.expires_at,
+            generation=stored.generation,
+        ),
+        expected_generation=0,
+    )
+
+    token = await service.get_token()
+
+    assert oauth.refresh_calls == 1
+    assert token.access_token == "refreshed-access"
 
 
 @pytest.mark.asyncio

@@ -727,8 +727,26 @@ class CodexOAuthService:
                     "Codex sign-in could not be renewed. Sign in to Codex again.",
                     401,
                 )
-            if credentials.expires_at - int(self._clock()) > 300:
+            now = int(self._clock())
+            if credentials.expires_at - now > 300:
                 return credentials.public_token()
+            # The OAuth response schedules a refresh after ~1 hour, but the
+            # access token's own JWT can stay valid much longer (OpenAI issues
+            # a 10-day exp). If the JWT is still valid, use it: forcing a
+            # refresh at that moment can fail on a flaky OAuth endpoint and
+            # turn a perfectly usable session into "authentication could not
+            # be refreshed". The CLI keeps working through exactly this case.
+            try:
+                claims = decode_codex_jwt(credentials.access_token)
+            except CodexAuthError:
+                claims = None
+            if claims and claims.expires_at and claims.expires_at - now > 300:
+                return CodexToken(
+                    access_token=credentials.access_token,
+                    account_id=credentials.account_id,
+                    expires_at=claims.expires_at,
+                    generation=credentials.generation,
+                )
             refreshed = await self._refresh_credentials(credentials)
             return refreshed.public_token()
 
