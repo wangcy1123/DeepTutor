@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 import hashlib
 import json
+import time
 from typing import Any
 
 import httpx
@@ -25,6 +26,17 @@ from deeptutor.services.llm.provider_core.openai_responses import (
 from deeptutor.services.llm.request_compat import is_transient_transport_error
 
 DEFAULT_ORIGINATOR = "DeepTutor"
+
+# A 401 is not proof that the OAuth token expired: a transient network path
+# or upstream rejection can answer 401 too. Treat the stored token as usable
+# while it has more than this much lifetime left, and retry the request once
+# with it before spending a refresh.
+_TOKEN_FRESH_WINDOW_SECONDS = 300
+
+
+def _token_is_fresh(token: CodexToken) -> bool:
+    """Whether ``token`` can be retried without forcing an OAuth refresh."""
+    return int(token.expires_at or 0) > int(time.time()) + _TOKEN_FRESH_WINDOW_SECONDS
 
 
 class CodexHTTPError(RuntimeError):
@@ -78,33 +90,63 @@ class OpenAICodexProvider(LLMProvider):
             try:
                 token = await self._load_token()
                 service.validate_runtime_profile(token, model_slug, reasoning_effort)
-                headers = _build_headers(token.account_id, token.access_token)
-                try:
-                    content, tool_calls, finish_reason = await _request_codex(
+
+                async def send(
+                    current: CodexToken,
+                ) -> tuple[str, list[ToolCallRequest], str]:
+                    return await _request_codex(
                         CODEX_RESPONSES_URL,
-                        headers,
+                        _build_headers(current.account_id, current.access_token),
                         body,
                         verify=not disable_ssl_verify_enabled(),
                         on_content_delta=on_content_delta,
                     )
+
+                try:
+                    content, tool_calls, finish_reason = await send(token)
                 except CodexHTTPError as exc:
-                    if exc.status_code == 401:
+                    if exc.status_code != 401:
+                        raise
+                    # Retry once with the cached token before refreshing. This
+                    # is what keeps the CLI stable through a brief network
+                    # wobble; a forced refresh at that moment can fail on the
+                    # OAuth endpoint and turn a transient 401 into a dead turn.
+                    # Only retry while the token is genuinely fresh.
+                    if _token_is_fresh(token):
                         try:
-                            await service.recover_after_unauthorized(token.generation)
-                        except CodexAuthError as refresh_error:
-                            # Only promise a retry when the session really was
-                            # renewed; a dead refresh token needs a new sign-in.
-                            logger.warning("Codex token renewal after HTTP 401 failed")
-                            if refresh_error.code in {
-                                "authentication_required",
-                                "token_refresh_rejected",
-                            }:
-                                raise CodexHTTPError(
-                                    exc.status_code,
-                                    "Codex login expired and could not be renewed. Sign in again.",
-                                ) from None
-                            raise
-                    raise
+                            content, tool_calls, finish_reason = await send(token)
+                        except CodexHTTPError as retry_exc:
+                            if retry_exc.status_code != 401:
+                                raise
+                        else:
+                            return LLMResponse(
+                                content=content,
+                                tool_calls=tool_calls,
+                                finish_reason=finish_reason,
+                            )
+                    try:
+                        await service.recover_after_unauthorized(token.generation)
+                    except CodexAuthError as refresh_error:
+                        # Only a rejected grant needs a new sign-in. A transport
+                        # failure reaching the OAuth endpoint is transient: let
+                        # the agent loop retry instead of failing the whole turn.
+                        logger.warning("Codex token renewal after HTTP 401 failed")
+                        if refresh_error.code in {
+                            "authentication_required",
+                            "token_refresh_rejected",
+                        }:
+                            raise CodexHTTPError(
+                                exc.status_code,
+                                "Codex login expired and could not be renewed. Sign in again.",
+                            ) from None
+                        if refresh_error.code == "token_refresh_failed":
+                            raise LLMProviderTransportError(
+                                "Codex token renewal failed transiently."
+                            ) from refresh_error
+                        raise
+                    refreshed = await self._load_token()
+                    service.validate_runtime_profile(refreshed, model_slug, reasoning_effort)
+                    content, tool_calls, finish_reason = await send(refreshed)
                 return LLMResponse(
                     content=content,
                     tool_calls=tool_calls,

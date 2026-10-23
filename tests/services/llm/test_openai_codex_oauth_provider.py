@@ -128,29 +128,91 @@ async def test_provider_uses_deeptutor_token_service_and_raw_model_id(
 
 
 @pytest.mark.asyncio
-async def test_401_refreshes_for_next_request_without_replay(
+async def test_401_with_fresh_token_retries_before_refreshing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A transient 401 must not burn a refresh while the token is still valid."""
     service = FakeCodexService()
     request_count = 0
 
-    async def rejected_request(*_args: Any, **_kwargs: Any) -> tuple[str, list[Any], str]:
+    async def flaky_request(*_args: Any, **_kwargs: Any) -> tuple[str, list[Any], str]:
         nonlocal request_count
         request_count += 1
-        raise CodexHTTPError(401, module._friendly_error(401))
+        if request_count == 1:
+            raise CodexHTTPError(401, module._friendly_error(401))
+        return "ok", [], "stop"
 
     monkeypatch.setattr(module, "get_codex_oauth_service", lambda: service)
-    monkeypatch.setattr(module, "_request_codex", rejected_request)
+    monkeypatch.setattr(module, "_request_codex", flaky_request)
 
     result = await OpenAICodexProvider().chat(
         [{"role": "user", "content": "hello"}],
         model="gpt-5.6-sol",
     )
 
-    assert request_count == 1
+    assert request_count == 2
+    assert service.recovered_generation is None
+    assert service.token_calls == 1
+    assert result.finish_reason == "stop"
+    assert result.content == "ok"
+
+
+@pytest.mark.asyncio
+async def test_401_after_fresh_retry_refreshes_and_replays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuinely rejected token refreshes, then the current call is replayed."""
+    service = FakeCodexService()
+    request_count = 0
+
+    async def rejected_then_ok(*_args: Any, **_kwargs: Any) -> tuple[str, list[Any], str]:
+        nonlocal request_count
+        request_count += 1
+        if request_count <= 2:
+            raise CodexHTTPError(401, module._friendly_error(401))
+        return "ok", [], "stop"
+
+    monkeypatch.setattr(module, "get_codex_oauth_service", lambda: service)
+    monkeypatch.setattr(module, "_request_codex", rejected_then_ok)
+
+    result = await OpenAICodexProvider().chat(
+        [{"role": "user", "content": "hello"}],
+        model="gpt-5.6-sol",
+    )
+
+    assert request_count == 3
     assert service.recovered_generation == service.token.generation
-    assert result.finish_reason == "error"
-    assert "retry" in result.content.lower()
+    assert service.token_calls == 2
+    assert result.finish_reason == "stop"
+    assert result.content == "ok"
+
+
+@pytest.mark.asyncio
+async def test_401_refresh_transport_failure_is_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable OAuth endpoint is transient, not a dead login."""
+    service = FakeCodexService()
+
+    async def failed_recovery(generation: int) -> None:
+        raise CodexAuthError(
+            "token_refresh_failed",
+            "Codex authentication could not be refreshed.",
+            502,
+        )
+
+    async def rejected_request(*_args: Any, **_kwargs: Any) -> tuple[str, list[Any], str]:
+        raise CodexHTTPError(401, module._friendly_error(401))
+
+    service.recover_after_unauthorized = failed_recovery  # type: ignore[method-assign]
+    monkeypatch.setattr(module, "get_codex_oauth_service", lambda: service)
+    monkeypatch.setattr(module, "_request_codex", rejected_request)
+
+    with pytest.raises(LLMProviderTransportError):
+        await OpenAICodexProvider().chat(
+            [{"role": "user", "content": "hello"}],
+            model="gpt-5.6-sol",
+        )
 
 
 @pytest.mark.asyncio
