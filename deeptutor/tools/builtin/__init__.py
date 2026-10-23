@@ -275,6 +275,11 @@ class RAGTool(_PromptHintsMixin, BaseTool):
                 result.public_result["content"] = (
                     "Source evidence could not be presented or verified."
                 )
+            # Keep the pre-seed view of this tool call in step with whatever
+            # the mastery branch just appended.
+            if isinstance(result.metadata, dict):
+                result.metadata["content"] = result.content
+                result.metadata["answer"] = result.content
         return result
 
     async def _retrieve(self, **kwargs: Any) -> ToolResult:
@@ -390,11 +395,16 @@ class RAGTool(_PromptHintsMixin, BaseTool):
                 f"No matching content was found in knowledge base '{kb_name}'. "
                 "The search completed successfully."
             )
+        # Build citations first: only this step turns a visual asset id into a
+        # reachable URL, and the model needs that URL in its text to embed the
+        # figure rather than describe it.
+        sources = _rag_sources(result, query=query, kb_name=kb_name)
         visual_sources = [
             source
-            for source in (result.get("sources") or [])
+            for source in sources
             if isinstance(source, dict) and source.get("visual_asset_id")
         ]
+        content += _rag_visual_links(visual_sources)
         model_message = None
         if visual_sources and vision_supported:
             model_message = _rag_visual_model_message(kb_name, visual_sources)
@@ -405,13 +415,53 @@ class RAGTool(_PromptHintsMixin, BaseTool):
                 "\nThe selected model cannot inspect source image pixels. "
                 "Use the retrieved caption and text context; do not claim to have seen the image."
             )
+        # The KB pre-seed path reads the model-facing text from
+        # ``metadata["content"]`` rather than from ToolResult.content, so the
+        # added headers/links have to be mirrored there or the seed block and
+        # the tool block disagree about what was retrieved.
+        metadata = {**result, "content": content, "answer": content}
         return ToolResult(
             content=content,
-            sources=_rag_sources(result, query=query, kb_name=kb_name),
-            metadata=result,
+            sources=sources,
+            metadata=metadata,
             success=not failed,
             model_message=model_message,
         )
+
+
+def _rag_visual_links(sources: list[dict[str, Any]], limit: int = 6) -> str:
+    """Markdown image links the model can copy into its answer.
+
+    The tool's ``sources`` list is rendered by the UI; it is never shown to
+    the model. So without this block a model that wants to illustrate an
+    explanation knows a figure exists but has no URL to embed, and settles
+    for describing it. Keeping the link in the tool text is what makes
+    "explain this with the relevant figure" produce an actual image.
+    """
+    lines: list[str] = []
+    for source in sources[:limit]:
+        url = source.get("visual_asset_url")
+        if not url:
+            continue
+        name = source.get("file_name") or source.get("title") or ""
+        page = source.get("page")
+        # Only the characters that would end the alt text early need removing;
+        # parentheses are legal there and captions such as "(a) 分压式偏置" read
+        # wrong without them.
+        caption = str(source.get("caption") or "source figure")
+        for char in "[]\n\r":
+            caption = caption.replace(char, " ")
+        where = name + (f", page {page}" if page not in ("", None) else "")
+        lines.append(f"- {where}: ![{caption.strip() or 'source figure'}]({url})")
+    if not lines:
+        return ""
+    return (
+        "\n\n[Retrieved source figures — when your explanation refers to one, embed "
+        "its Markdown snippet verbatim so the reader sees the actual figure. These "
+        "are site-relative paths: copy the leading \"/\" exactly and never add a "
+        "scheme or host such as https://]\n"
+        + "\n".join(lines)
+    )
 
 
 def _rag_visual_model_message(kb_name: str, sources: list[dict[str, Any]]) -> dict[str, Any] | None:
