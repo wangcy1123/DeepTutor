@@ -112,9 +112,19 @@ class SubagentCapability(KnowledgeCapability):
             else []
         )
         updated = dict(kwargs)
+        cwd = str(conn.get("cwd") or "")
+        workspace = getattr(getattr(context, "runtime", None), "workspace", None)
+        if str(getattr(context, "active_capability", "") or "") == "visualize" and workspace:
+            # Visualize exposes only logical workspace paths (outputs/…) to the
+            # model. A local agent started in its own cwd writes the same
+            # relative path to a different tree, so workspace_read cannot see
+            # the file. Run it in the turn's workspace instead.
+            turn_root = str(getattr(workspace, "root", "") or "")
+            if turn_root:
+                cwd = turn_root
         updated["_subagent"] = {
             "kind": conn["kind"],
-            "cwd": conn.get("cwd") or "",
+            "cwd": cwd,
             "partner_id": conn.get("partner_id") or "",
             "name": conn["name"],
             "budget": _resolve_budget(context),
