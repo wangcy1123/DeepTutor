@@ -270,6 +270,10 @@ class AgenticLoopPipeline:
     #: the ``/files/outputs`` download route off it, so a per-loop namespace
     #: would make generated files unreachable rather than merely tidier.
     workspace_namespace: str = "chat"
+    #: Idle timeout for one provider stream. ``None`` keeps the loop default;
+    #: a reasoning-heavy capability (visualize) can raise it without changing
+    #: chat's faster failure behaviour.
+    stream_idle_timeout: float | None = None
 
     def __init__(
         self,
@@ -282,6 +286,7 @@ class AgenticLoopPipeline:
         event_source: str = "chat",
         event_stage: str = "responding",
         emit_result: bool = True,
+        stream_idle_timeout: float | None = None,
     ) -> None:
         # Prompt resources fall back to English; the requested output language
         # must still reach the assembler's final language directive.
@@ -315,6 +320,8 @@ class AgenticLoopPipeline:
         self.event_source = str(event_source or "chat")
         self.event_stage = str(event_stage or "responding")
         self.emit_result = bool(emit_result)
+        if stream_idle_timeout is not None:
+            self.stream_idle_timeout = max(1.0, float(stream_idle_timeout))
         self.last_result: dict[str, Any] | None = None
 
         try:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 from deeptutor.agents._shared.capability_result import emit_capability_result
@@ -28,6 +29,21 @@ from deeptutor.visualizers.registry import get_visualizer_registry
 from deeptutor.visualizers.store import VisualizerStoreError
 
 logger = logging.getLogger(__name__)
+
+
+def _visualize_stream_idle_timeout() -> float:
+    """Idle bound for the generation stream, in seconds.
+
+    A long single-file HTML/SVG reply can spend minutes reasoning before its
+    first visible chunk; chat's 90-second bound would kill it. Configurable
+    through ``DEEPTUTOR_VISUALIZE_STREAM_IDLE_TIMEOUT``.
+    """
+    raw = os.getenv("DEEPTUTOR_VISUALIZE_STREAM_IDLE_TIMEOUT", "240")
+    try:
+        return max(30.0, float(raw))
+    except (TypeError, ValueError):
+        return 240.0
+
 
 # Default (English) copy for the tool-calling diagnosis, kept beside the code
 # that emits it. StatusI18n prefers the localized strings in this capability's
@@ -193,6 +209,7 @@ class VisualizeCapability(TurnCapability):
             event_source=self.name,
             event_stage="generating",
             emit_result=False,
+            stream_idle_timeout=_visualize_stream_idle_timeout(),
         )
         loop_result = await pipeline.run(context, stream)
         envelope = context.metadata.get(VISUALIZATION_RESULT_KEY)

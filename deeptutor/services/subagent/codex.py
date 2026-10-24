@@ -116,6 +116,12 @@ class CodexBackend(SubagentBackend):
         for path in images or []:
             cmd += ["-i", path]
         cmd += list(config.extra_args)
+        # End option parsing before the prompt. Codex 0.160.x otherwise
+        # occasionally falls through to its stdin path and exits with
+        # "No prompt provided via stdin" when a long/Unicode prompt is the
+        # trailing positional; ``--`` makes the prompt unambiguous. It also
+        # stops the variadic ``-i`` form from consuming the prompt.
+        cmd.append("--")
         cmd.append(question)
         return cmd
 
@@ -131,6 +137,51 @@ class CodexBackend(SubagentBackend):
         partner_id: str | None = None,  # noqa: ARG002 — partner-only; ignored here
     ) -> ConsultResult:
         config = config or BackendConfig()
+        result = await self._consult_once(
+            question,
+            on_event=on_event,
+            cwd=cwd,
+            session_id=session_id,
+            config=config,
+            images=images,
+        )
+        # A run that exited before reading its prompt (no thread, no answer)
+        # did no work; retry once from a fresh session. Runs that started a
+        # thread or produced text are never replayed.
+        if (
+            not result.success
+            and not result.final_text
+            and not result.session_id
+            and result.error.startswith("codex exited with code")
+        ):
+            await on_event(
+                SubagentEvent(
+                    kind=EVENT_LOG,
+                    text="The agent exited before reading the prompt; retrying once.",
+                    raw={},
+                    meta={},
+                )
+            )
+            result = await self._consult_once(
+                question,
+                on_event=on_event,
+                cwd=cwd,
+                session_id=None,
+                config=config,
+                images=images,
+            )
+        return result
+
+    async def _consult_once(
+        self,
+        question: str,
+        *,
+        on_event: OnEvent,
+        cwd: str | None,
+        session_id: str | None,
+        config: BackendConfig,
+        images: list[str] | None,
+    ) -> ConsultResult:
         cmd = self._build_command(question, session_id=session_id, config=config, images=images)
         result = ConsultResult(session_id=session_id)
 

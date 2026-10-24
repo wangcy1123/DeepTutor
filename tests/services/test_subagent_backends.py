@@ -9,6 +9,7 @@ to prove the streaming primitive surfaces stdout/stderr in order with an exit.
 
 from __future__ import annotations
 
+import json
 import sys
 
 import pytest
@@ -52,9 +53,11 @@ def test_codex_command_build_sandbox_and_resume() -> None:
     assert "--json" in fresh and "--skip-git-repo-check" in fresh
     assert "-c" in fresh and 'sandbox_mode="workspace-write"' in fresh
     assert fresh[-1] == "hi"  # prompt is the trailing positional
+    assert fresh[-2] == "--"  # option parsing ends before the prompt
 
     resumed = backend._build_command("again", session_id="abc", config=cfg)
     assert resumed[1:3] == ["exec", "resume"] and "abc" in resumed
+    assert resumed[-2:] == ["--", "again"]
 
 
 def test_claude_command_applies_model_effort_system_prompt() -> None:
@@ -114,6 +117,51 @@ def test_codex_command_attaches_images_with_repeated_flag() -> None:
     assert cmd.count("-i") == 2
     assert cmd[cmd.index("-i") + 1] == "/tmp/dt-y/00_a.png"
     assert cmd[-1] == "look"  # prompt stays the trailing positional
+
+
+@pytest.mark.asyncio
+async def test_codex_consult_retries_once_when_cli_exits_before_reading_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.services.subagent import codex as codex_module
+
+    backend = CodexBackend()
+    calls: list[list[str]] = []
+
+    async def fake_stream(cmd, *, cwd=None, env=None):
+        calls.append(list(cmd))
+        if len(calls) == 1:
+            yield "stderr", "Reading prompt from stdin..."
+            yield "stderr", "No prompt provided via stdin."
+            yield "exit", "1"
+            return
+        yield "stdout", json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "OK"},
+            }
+        )
+        yield "exit", "0"
+
+    monkeypatch.setattr(codex_module, "stream_process_lines", fake_stream)
+    emitted = []
+
+    async def on_event(event):
+        emitted.append(event)
+
+    result = await backend.consult(
+        "hi",
+        on_event=on_event,
+        cwd="/tmp",
+        config=BackendConfig(),
+    )
+
+    assert result.success is True
+    assert result.final_text == "OK"
+    assert len(calls) == 2
+    assert calls[0][-2:] == ["--", "hi"]
+    assert calls[1][-2:] == ["--", "hi"]
+    assert any("retrying" in event.text.lower() for event in emitted)
 
 
 # ---- Hermes Agent / OpenClaw / DeepSeek Harness -----------------------------
